@@ -1,0 +1,6 @@
+hospital_id,hospital_name,hospital_type,city
+HSP-01,Victoria Government Hospital,GOVERNMENT,Bengaluru
+HSP-02,Sanjeevini Multispeciality Hospital,PRIVATE,Bengaluru
+HSP-03,Kaveri Women & Children Hospital,PRIVATE,Bengaluru
+HSP-04,District Hospital Ramanagara,GOVERNMENT,Ramanagara
+HSP-05,Lakeview Heart Institute,PRIVATE,Bengaluru
