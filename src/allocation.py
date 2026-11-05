@@ -87,3 +87,47 @@ def select_fefo_unit(units):
     )
 
     return valid_units[0]
+
+
+def allocate_blood_unit(
+    patient_group,
+    patient_rh,
+    units_by_group,
+    emergency=False
+):
+    """
+    Selects the best blood group and then selects
+    the earliest-expiring unit from that group.
+    """
+
+    # Count available units in each blood group
+    stock = {
+        blood_group: len(units)
+        for blood_group, units in units_by_group.items()
+    }
+
+    # Select the best blood group
+    selected_group = select_best_blood_group(
+        patient_group,
+        patient_rh,
+        stock,
+        emergency
+    )
+
+    # No compatible stock available
+    if selected_group is None:
+        return None
+
+    # Select the earliest-expiring unit
+    selected_unit = select_fefo_unit(
+        units_by_group[selected_group]
+    )
+
+    if selected_unit is None:
+        return None
+
+    return {
+        "unit": selected_unit,
+        "blood_group": selected_group,
+        "reason": "GROUP_PRIORITY_AND_FEFO"
+    }
