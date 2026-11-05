@@ -1,4 +1,7 @@
-from src.blood_compatibility import check_prbc_compatibility
+from src.blood_compatibility import (
+    check_prbc_compatibility,
+    check_emergency_rh_exception
+)
 
 def select_best_blood_group(
     patient_group,
@@ -93,11 +96,14 @@ def allocate_blood_unit(
     patient_group,
     patient_rh,
     units_by_group,
-    emergency=False
+    emergency=False,
+    patient_gender=None,
+    patient_age=None
 ):
     """
-    Selects the best blood group and then selects
-    the earliest-expiring unit from that group.
+    Selects the best compatible blood group and unit.
+
+    Supports the emergency Rh-positive exception under BR-04.
     """
 
     # Count available units in each blood group
@@ -106,7 +112,7 @@ def allocate_blood_unit(
         for blood_group, units in units_by_group.items()
     }
 
-    # Select the best blood group
+    # First, try normal PRBC compatibility
     selected_group = select_best_blood_group(
         patient_group,
         patient_rh,
@@ -114,20 +120,71 @@ def allocate_blood_unit(
         emergency
     )
 
-    # No compatible stock available
-    if selected_group is None:
-        return None
+    # If normal compatibility finds stock, use it
+    if selected_group is not None:
+        selected_unit = select_fefo_unit(
+            units_by_group[selected_group]
+        )
 
-    # Select the earliest-expiring unit
-    selected_unit = select_fefo_unit(
-        units_by_group[selected_group]
-    )
+        if selected_unit is not None:
+            return {
+                "unit": selected_unit,
+                "blood_group": selected_group,
+                "reason": "GROUP_PRIORITY_AND_FEFO"
+            }
 
-    if selected_unit is None:
-        return None
+    # BR-04: Check emergency Rh exception
+    if emergency and patient_rh.upper() in ["NEG", "-"]:
 
-    return {
-        "unit": selected_unit,
-        "blood_group": selected_group,
-        "reason": "GROUP_PRIORITY_AND_FEFO"
-    }
+        # Count compatible Rh-negative stock
+        rh_negative_stock = 0
+
+        for blood_group, units in units_by_group.items():
+            donor_group = blood_group[:-1]
+
+            if blood_group.endswith("-"):
+                if check_prbc_compatibility(
+                    donor_group,
+                    "NEG",
+                    patient_group,
+                    "NEG"
+                ):
+                    rh_negative_stock += len(units)
+
+        # Check whether the patient qualifies
+        eligible_for_exception = check_emergency_rh_exception(
+            "POS",
+            patient_rh,
+            patient_gender or "",
+            patient_age or 0,
+            "EMERGENCY",
+            rh_negative_stock
+        )
+
+        if eligible_for_exception:
+
+            # Find ABO-compatible Rh-positive units
+            for blood_group, units in units_by_group.items():
+
+                if not blood_group.endswith("+") or not units:
+                    continue
+
+                donor_group = blood_group[:-1]
+
+                abo_compatible = check_prbc_compatibility(
+                    donor_group,
+                    "NEG",
+                    patient_group,
+                    "NEG"
+                )
+
+                if abo_compatible:
+                    selected_unit = select_fefo_unit(units)
+
+                    return {
+                        "unit": selected_unit,
+                        "blood_group": blood_group,
+                        "reason": "EMERGENCY_RH_POS"
+                    }
+
+    return None
