@@ -66,3 +66,44 @@ def test_female_donation_interval():
     result = check_donor_eligibility(donor, donation)
 
     assert result == ("DEFERRED", "BR-01: DONATION_INTERVAL")
+
+def test_exactly_45_kg_and_12_5_hb():
+    donor = create_donor()
+    donation = create_donation(weight="45", hb="12.5")
+
+    assert check_donor_eligibility(donor, donation) == ("ACCEPTED", "")
+
+
+def test_male_exactly_90_days():
+    donor = create_donor(last_donation="2026-07-12")
+    donation = create_donation()
+
+    assert check_donor_eligibility(donor, donation) == ("ACCEPTED", "")
+
+
+def test_female_exactly_120_days():
+    donor = create_donor(
+        gender="F",
+        last_donation="2026-06-12"
+    )
+    donation = create_donation()
+
+    assert check_donor_eligibility(donor, donation) == ("ACCEPTED", "")
+
+
+def test_donor_exactly_65_years():
+    donor = create_donor()
+    donor["date_of_birth"] = "1961-10-10"
+    donation = create_donation()
+
+    assert check_donor_eligibility(donor, donation) == ("ACCEPTED", "")
+
+
+def test_first_time_donor_above_60():
+    donor = create_donor(age_status="true")
+    donor["date_of_birth"] = "1965-10-10"
+    donation = create_donation()
+
+    assert check_donor_eligibility(donor, donation) == (
+        "DEFERRED", "BR-01: FIRST_TIME_AGE"
+    )
