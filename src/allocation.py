@@ -1,7 +1,13 @@
-from src.blood_compatibility import (
-    check_prbc_compatibility,
-    check_emergency_rh_exception
-)
+try:
+    from .blood_compatibility import (
+        check_prbc_compatibility,
+        check_emergency_rh_exception
+    )
+except ImportError:
+    from blood_compatibility import (
+        check_prbc_compatibility,
+        check_emergency_rh_exception
+    )
 
 def select_best_blood_group(
     patient_group,

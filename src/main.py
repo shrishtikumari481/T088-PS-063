@@ -1,3 +1,4 @@
+from inventory_engine import InventoryEngine
 import csv
 from pathlib import Path
 
@@ -94,10 +95,7 @@ def load_commands():
                     f"Incorrect number of fields at line {line_number}"
                 )
 
-            if any(value == "" for value in values):
-                raise ValueError(
-                    f"Empty field at line {line_number}"
-                )
+            
 
             commands.append({
                 "type": command_type,
@@ -169,6 +167,12 @@ def main():
     # Load commands
     commands = load_commands()
 
+    engine = InventoryEngine(data)
+
+    engine.process_commands(commands)
+
+    engine.export_outputs()
+
     print("\nInput data loaded successfully!")
 
     for name, rows in data.items():
@@ -176,10 +180,19 @@ def main():
 
     print("Commands loaded:", len(commands))
 
-    # Generate donor eligibility report
+   # Generate donor eligibility report
     generate_eligibility_report(data)
 
-    print("\nInitial application setup completed.")
+   # Initialize and execute the inventory engine
+    engine = InventoryEngine(data)
+
+   # Process all commands from commands.txt
+    engine.process_commands(commands)
+
+   # Generate the output CSV files
+    engine.export_outputs()
+
+print("\nApplication processing completed.")
 
 
 if __name__ == "__main__":

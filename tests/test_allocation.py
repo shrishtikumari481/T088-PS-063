@@ -146,3 +146,70 @@ def test_complete_allocation_returns_none_without_stock():
     )
 
     assert result is None
+
+
+def test_emergency_rh_exception_for_male():
+    units_by_group = {
+        "A+": [
+            {
+                "unit_id": "U101",
+                "expiry_date": "2026-11-07 23:59:00"
+            }
+        ]
+    }
+
+    result = allocate_blood_unit(
+        "A",
+        "NEG",
+        units_by_group,
+        emergency=True,
+        patient_gender="M",
+        patient_age=30
+    )
+
+    assert result is not None
+    assert result["blood_group"] == "A+"
+
+
+def test_emergency_rh_exception_for_female_over_50():
+    units_by_group = {
+        "A+": [
+            {
+                "unit_id": "U102",
+                "expiry_date": "2026-11-07 23:59:00"
+            }
+        ]
+    }
+
+    result = allocate_blood_unit(
+        "A",
+        "NEG",
+        units_by_group,
+        emergency=True,
+        patient_gender="F",
+        patient_age=51
+    )
+
+    assert result is not None
+
+
+def test_female_exactly_50_cannot_receive_rh_positive():
+    units_by_group = {
+        "A+": [
+            {
+                "unit_id": "U103",
+                "expiry_date": "2026-11-07 23:59:00"
+            }
+        ]
+    }
+
+    result = allocate_blood_unit(
+        "A",
+        "NEG",
+        units_by_group,
+        emergency=True,
+        patient_gender="F",
+        patient_age=50
+    )
+
+    assert result is None
