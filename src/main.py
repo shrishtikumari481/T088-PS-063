@@ -1,8 +1,8 @@
-from inventory_engine import InventoryEngine
+from src.inventory_engine import InventoryEngine
 import csv
 from pathlib import Path
 
-from donor_eligibility import check_donor_eligibility
+from src.donor_eligibility import check_donor_eligibility
 
 
 # Project folders

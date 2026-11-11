@@ -4,27 +4,27 @@ from datetime import datetime, timedelta
 RESERVATION_HOURS = 72
 
 
-def create_reservation(unit_id, request_id, reservation_ts):
-    """
-    Creates a 72-hour reservation for a PRBC unit.
-    """
+def create_reservation(
+    unit_id,
+    request_id,
+    reservation_ts,
+    urgency="ROUTINE"
+):
+    """Create a 72-hour reservation for a PRBC unit."""
 
     reservation_time = datetime.strptime(
         reservation_ts, "%Y-%m-%d %H:%M:%S"
     )
 
-    expiry_time = reservation_time + timedelta(
-        hours=RESERVATION_HOURS
-    )
+    expiry_time = reservation_time + timedelta(hours=RESERVATION_HOURS)
 
     return {
         "unit_id": unit_id,
         "request_id": request_id,
+        "urgency": urgency.upper(),
         "reservation_state": "CROSSMATCHED",
         "reservation_ts": reservation_ts,
-        "release_ts": expiry_time.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        "release_ts": expiry_time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
 def check_reservation_status(reservation, current_ts):
