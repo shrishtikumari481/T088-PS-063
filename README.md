@@ -36,3 +36,44 @@ screening, inventory, and hospital requests.
 ## Team
 - Shrishti Kumari
 - USN: 1AT24CG078
+
+## Run the project
+
+Use Python 3.10 or newer (tested with Python 3.13).
+
+From the project root:
+
+```bash
+python -m pip install pytest
+python -m src.main
+```
+
+The application reads the CSV files in `data/`, processes `data/commands.txt`
+in strict file order, and writes the five required reports to `outputs/`.
+
+## Run automated tests
+
+```bash
+python -m pytest -q
+```
+
+The regression suite covers donor eligibility, component expiry, screening,
+compatibility, allocation, cross-match reservations, request SLA, hospital
+quotas, stock alerts, billing, returns, cancellation, and platelet pooling.
+
+## Input and output contract
+
+The application accepts the company-provided CSV schema and command types:
+`DONATION`, `SCREENING`, `REQUEST`, `ISSUE`, `RETURN`, `CROSSMATCH_RESULT`,
+`CANCEL_REQUEST`, `DAILY_RUN`, `PRINT_STOCK`, and `PRINT_INVOICE`.
+
+Generated files:
+- `outputs/unit_status.csv`
+- `outputs/donation_eligibility.csv`
+- `outputs/allocations.csv`
+- `outputs/stock_positions.csv`
+- `outputs/invoices.csv`
+
+All output headers follow the required column order in the supplied data-pack
+README. The application does not require a graphical interface; it is a
+CSV-driven Python backend.

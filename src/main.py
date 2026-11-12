@@ -95,7 +95,7 @@ def load_commands():
                     f"Incorrect number of fields at line {line_number}"
                 )
 
-            
+
 
             commands.append({
                 "type": command_type,
@@ -158,41 +158,21 @@ def generate_eligibility_report(data):
 
 
 def main():
-
+    """Load inputs, process the command stream once, and export all reports."""
     print("Starting Blood Bank Inventory System...")
 
-    # Load all input data
     data = load_all_data()
-
-    # Load commands
     commands = load_commands()
 
     engine = InventoryEngine(data)
-
     engine.process_commands(commands)
-
     engine.export_outputs()
 
-    print("\nInput data loaded successfully!")
-
+    print("\\nInput data loaded successfully!")
     for name, rows in data.items():
         print(f"{name}: {len(rows)} records")
-
     print("Commands loaded:", len(commands))
-
-   # Generate donor eligibility report
-    generate_eligibility_report(data)
-
-   # Initialize and execute the inventory engine
-    engine = InventoryEngine(data)
-
-   # Process all commands from commands.txt
-    engine.process_commands(commands)
-
-   # Generate the output CSV files
-    engine.export_outputs()
-
-print("\nApplication processing completed.")
+    print("\\nApplication processing completed.")
 
 
 if __name__ == "__main__":

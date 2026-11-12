@@ -2,10 +2,6 @@ import csv
 from src.request_sla import calculate_sla_deadline
 from pathlib import Path
 from datetime import datetime, timedelta
-from unittest import result
-from unittest import result
-from urllib import request
-from urllib import request
 
 from src import allocation
 
@@ -129,6 +125,19 @@ class InventoryEngine:
             for hospital in data["hospitals"]
         }
 
+        # Load daily hospital quotas
+        self.hospital_quotas = {
+            (item["hospital_id"], item["component"].upper()):
+                int(item["daily_cap_units"])
+            for item in data.get("hospital_quotas", [])
+        }
+
+        # Track daily issued units by hospital and component
+        self.daily_issued_units = {}
+
+        # Track monthly mobilised donations
+        self.monthly_mobilised_donations = {}
+
         self.requests = {
             request["request_id"]: request
             for request in data["requests"]
@@ -168,6 +177,7 @@ class InventoryEngine:
 
         # Store pending requests
         self.shortage_queue = []
+        self.platelet_pools = []
 
         # Store generated reports
         self.output_records = {
@@ -532,6 +542,153 @@ class InventoryEngine:
             ).append(unit_data)
 
                 # Calculate request SLA deadline
+        # BR-11: If an emergency has no compatible available PRBC stock,
+        # pre-empt one routine cross-match reservation.
+        if component_type == "PRBC" and urgency == "EMERGENCY":
+            available_choice = allocate_blood_unit(
+                patient_group, patient_rh, units_by_group,
+                emergency=True, patient_gender=patient_gender,
+                patient_age=patient_age
+            )
+            if available_choice is None:
+                for reservation in self.reservations:
+                    if (
+                        reservation.get("reservation_state") != "CROSSMATCHED"
+                        or reservation.get("urgency") != "ROUTINE"
+                    ):
+                        continue
+                    reserved_unit_id = reservation["unit_id"]
+                    reserved_info = self.unit_status.get(reserved_unit_id, {})
+                    if reserved_info.get("status") != "CROSSMATCHED":
+                        continue
+
+                    # A reservation at or beyond 72 hours is released normally,
+                    # not recorded as an emergency pre-emption.
+                    if check_reservation_status(reservation, current_ts) == "AVAILABLE":
+                        reservation["reservation_state"] = "RELEASED"
+                        reserved_info["status"] = "AVAILABLE"
+                        reserved_info["reason"] = "RESERVATION_EXPIRED"
+                        for old_alloc in self.allocations:
+                            if old_alloc["unit_id"] == reserved_unit_id and old_alloc["request_id"] == reservation["request_id"]:
+                                old_alloc["reservation_state"] = "RELEASED"
+                        continue
+
+                    reserved_component = self.components.get(reserved_unit_id)
+                    if not reserved_component:
+                        continue
+                    reserved_donation = self.donations.get(reserved_component.get("donation_id"))
+                    if not reserved_donation:
+                        continue
+                    reserved_donor = self.donors.get(reserved_donation.get("donor_id"))
+                    if not reserved_donor:
+                        continue
+
+                    donor_group = reserved_donor["blood_group"].upper()
+                    donor_rh = reserved_donor["rh"].upper()
+                    blood_type = donor_group + ("+" if donor_rh in ("POS", "+") else "-")
+                    expiry = reserved_info.get("expiry_date", "")
+                    if not expiry or expiry < current_ts:
+                        continue
+
+                    candidate = dict(reserved_component)
+                    candidate["unit_id"] = reserved_unit_id
+                    candidate["expiry_date"] = expiry
+                    trial_groups = {key: list(value) for key, value in units_by_group.items()}
+                    trial_groups.setdefault(blood_type, []).append(candidate)
+                    trial_choice = allocate_blood_unit(
+                        patient_group, patient_rh, trial_groups,
+                        emergency=True, patient_gender=patient_gender,
+                        patient_age=patient_age
+                    )
+                    if not trial_choice or trial_choice["unit"]["unit_id"] != reserved_unit_id:
+                        continue
+
+                    old_request_id = reservation["request_id"]
+                    reservation["reservation_state"] = "PREEMPTED"
+                    reserved_info["status"] = "AVAILABLE"
+                    reserved_info["reason"] = "EMERGENCY_PREEMPTION"
+
+                    for old_alloc in self.allocations:
+                        if old_alloc["unit_id"] == reserved_unit_id and old_alloc["request_id"] == old_request_id:
+                            old_alloc["reservation_state"] = "PREEMPTED"
+                    for old_alloc in self.output_records["allocations.csv"]:
+                        if old_alloc["unit_id"] == reserved_unit_id and old_alloc["request_id"] == old_request_id:
+                            old_alloc["reservation_state"] = "PREEMPTED"
+
+                    old_state = self.request_status.get(old_request_id)
+                    if old_state:
+                        old_state["allocated_units"] = [
+                            item for item in old_state.get("allocated_units", [])
+                            if item != reserved_unit_id
+                        ]
+                        old_state["shortfall"] = old_state.get("shortfall", 0) + 1
+                        old_state["status"] = "PARTIAL" if old_state["allocated_units"] else "PENDING"
+                        queue_item = next(
+                            (item for item in self.shortage_queue if item["request_id"] == old_request_id),
+                            None
+                        )
+                        if queue_item:
+                            queue_item["shortfall"] = old_state["shortfall"]
+                        else:
+                            self.shortage_queue.append({
+                                "request_id": old_request_id,
+                                "urgency": old_state.get("urgency", "ROUTINE"),
+                                "request_ts": old_state.get("request_ts", current_ts),
+                                "shortfall": old_state["shortfall"]
+                            })
+
+                    self.output_records["unit_status.csv"].append({
+                        "unit_id": reserved_unit_id, "ts": current_ts,
+                        "status": "AVAILABLE", "reason": "EMERGENCY_PREEMPTION"
+                    })
+                    units_by_group.setdefault(blood_type, []).append(candidate)
+                    break
+
+        # BR-09: Critical stock (<2 units) is reserved for urgent/emergency requests.
+        if urgency == "ROUTINE":
+            units_by_group = {
+                group: group_units
+                for group, group_units in units_by_group.items()
+                if check_stock_alert(len(group_units), group) != "CRITICAL"
+            }
+
+        # BR-12: Multi-unit platelet requests must form a valid same-group pool
+        # whose member expiries are all within 24 hours of one another.
+        if component_type == "PLATELET" and units_to_allocate > 1:
+            platelet_group = patient_group + ("+" if patient_rh in ["POS", "+"] else "-")
+            candidates = sorted(
+                units_by_group.get(platelet_group, []),
+                key=lambda unit: unit["expiry_date"]
+            )
+            valid_pool = None
+            for start_index in range(max(0, len(candidates) - units_to_allocate + 1)):
+                window = candidates[start_index:start_index + units_to_allocate]
+                if len(window) != units_to_allocate:
+                    continue
+                pool_units = [
+                    {
+                        "unit_id": unit["unit_id"],
+                        "blood_group": patient_group,
+                        "expiry_date": unit["expiry_date"]
+                    }
+                    for unit in window
+                ]
+                try:
+                    pool_record = create_platelet_pool(pool_units)
+                    valid_pool = (window, pool_record)
+                    break
+                except ValueError:
+                    continue
+            if valid_pool:
+                chosen_units, pool_record = valid_pool
+                self.platelet_pools.append({
+                    "request_id": request_id,
+                    **pool_record
+                })
+                units_by_group = {platelet_group: chosen_units}
+            else:
+                units_by_group = {}
+
         request_ts = self.request_status[request_id]["request_ts"]
 
         sla_deadline = calculate_sla_deadline(
@@ -650,35 +807,23 @@ class InventoryEngine:
             unit_group = donor_record_for_unit["blood_group"]
             unit_rh = donor_record_for_unit["rh"]
 
-            # PRBC units receive a 72-hour reservation
-            if component_type == "PRBC":
+            # Routine/urgent PRBC allocations are cross-matched and reserved.
+            # Emergency PRBC allocations proceed uncrossmatched; retrospective
+            # cross-match is tracked after ISSUE (BR-06).
+            if component_type == "PRBC" and urgency != "EMERGENCY":
                 reservation = create_reservation(
-                    unit_id,
-                    request_id,
-                    current_ts,
-                    urgency=urgency
+                    unit_id, request_id, current_ts, urgency=urgency
                 )
-
                 self.reservations.append(reservation)
                 reservation_state = "CROSSMATCHED"
-
-                self.unit_status.setdefault(
-                    unit_id,
-                    {
-                        "status": "AVAILABLE",
-                        "reason": "INITIALIZED_DURING_ALLOCATION"
-                    }
-                )
-
                 self.unit_status[unit_id]["status"] = "CROSSMATCHED"
                 self.unit_status[unit_id]["reason"] = "RESERVED"
-
             else:
                 reservation_state = "ALLOCATED"
 
             self.request_status[request_id]["allocated_units"].append(unit_id)
 
-            self.allocations.append({
+            allocation_record = {
                 "request_id": request_id,
                 "unit_id": unit_id,
                 "unit_group": unit_group,
@@ -688,11 +833,23 @@ class InventoryEngine:
                 "allocated_ts": current_ts,
                 "sla_met": sla_met,
                 "note": ""
-            })
+            }
 
-            self.output_records["allocations.csv"].append(
-                self.allocations[-1]
+            # Reuse a historical row for the same request/unit pair when
+            # a released or pre-empted unit is legitimately reallocated.
+            existing_allocation = next(
+                (
+                    item for item in self.allocations
+                    if item["request_id"] == request_id
+                    and item["unit_id"] == unit_id
+                ),
+                None
             )
+            if existing_allocation:
+                existing_allocation.update(allocation_record)
+            else:
+                self.allocations.append(allocation_record)
+                self.output_records["allocations.csv"].append(allocation_record)
 
             # Remove the allocated unit from available stock
             for group_units in units_by_group.values():
@@ -746,6 +903,39 @@ class InventoryEngine:
                 if item["request_id"] != request_id
             ]
 
+        # Keep one explicit output row for any remaining shortfall.
+        shortfall_row = next(
+            (
+                row for row in self.output_records["allocations.csv"]
+                if row["request_id"] == request_id
+                and row.get("reservation_state") == "SHORTFALL"
+            ),
+            None
+        )
+        if shortfall > 0:
+            shortfall_values = {
+                "request_id": request_id,
+                "unit_id": "",
+                "unit_group": "",
+                "unit_rh": "",
+                "compatibility_path": "",
+                "reservation_state": "SHORTFALL",
+                "allocated_ts": current_ts,
+                "sla_met": sla_met,
+                "note": f"UNFILLED_UNITS:{shortfall}"
+            }
+            if shortfall_row is None:
+                self.output_records["allocations.csv"].append(shortfall_values)
+            else:
+                shortfall_row.update(shortfall_values)
+        elif shortfall_row is not None:
+            self.output_records["allocations.csv"].remove(shortfall_row)
+
+        # Emergency PRBC requests are issued immediately without waiting
+        # for a cross-match; the retrospective result is tracked separately.
+        if component_type == "PRBC" and urgency == "EMERGENCY" and allocated_count > 0:
+            self.process_issue(request_id, current_ts)
+
         print(
             "Request processed:",
             request_id,
@@ -775,9 +965,63 @@ class InventoryEngine:
             print("No allocated units available to issue:", request_id)
             return False
 
-        issued_count = 0
+        # BR-08: Enforce hospital quotas when quota data is configured.
+        request = self.requests[request_id]
+        hospital_id = request["hospital_id"]
+        component_type = request["component"].upper()
+        urgency = request["urgency"].upper()
+        issue_date = current_ts[:10]
+        issue_month = current_ts[:7]
+        quota_key = (hospital_id, component_type, issue_date)
 
-        for allocation in request_allocations:
+        # Small unit-test fixtures may omit quota data. In that case,
+        # quota enforcement is disabled rather than treating the cap as zero.
+        if (hospital_id, component_type) in self.hospital_quotas:
+            already_issued_today = self.daily_issued_units.get(quota_key, 0)
+            normal_quota = self.hospital_quotas[(hospital_id, component_type)]
+
+            mobilised_donations = sum(
+                1 for donation in self.donations.values()
+                if donation.get("mobilised_by_hospital_id") == hospital_id
+                and donation.get("collection_ts", "")[:7] == issue_month
+            )
+
+            monthly_issued = sum(
+                1 for unit_info in self.unit_status.values()
+                if unit_info.get("issued_ts", "")[:7] == issue_month
+                and unit_info.get("issued_request_id") in self.requests
+                and self.requests[unit_info["issued_request_id"]]["hospital_id"] == hospital_id
+            )
+
+            replacement_ratio = calculate_replacement_ratio(
+                monthly_issued, mobilised_donations
+            )
+
+            adjusted_quota = normal_quota
+            if urgency == "ROUTINE":
+                adjusted_quota = calculate_adjusted_quota(
+                    normal_quota, replacement_ratio
+                )
+
+            quota_result = check_daily_quota(
+                adjusted_quota,
+                already_issued_today,
+                len(request_allocations),
+                urgency
+            )
+            approved_units = quota_result["approved_units"]
+        else:
+            approved_units = len(request_allocations)
+
+        issued_count = 0
+        quota_skipped_allocations = []
+
+        for allocation_index, allocation in enumerate(request_allocations):
+
+            # Preserve unissued units as a queued shortfall when the quota is reached.
+            if issued_count >= approved_units:
+                quota_skipped_allocations.extend(request_allocations[allocation_index:])
+                break
 
             unit_id = allocation["unit_id"]
 
@@ -830,6 +1074,13 @@ class InventoryEngine:
             self.unit_status[unit_id]["issued_ts"] = current_ts
             self.unit_status[unit_id]["issued_request_id"] = request_id
 
+            if request["component"].upper() == "PRBC" and request["urgency"].upper() == "EMERGENCY":
+                issue_time = datetime.strptime(current_ts, TIMESTAMP_FORMAT)
+                self.unit_status[unit_id]["retrospective_crossmatch"] = "PENDING"
+                self.unit_status[unit_id]["retrospective_crossmatch_due_ts"] = (
+                    issue_time + timedelta(hours=24)
+                ).strftime(TIMESTAMP_FORMAT)
+
             # Update allocation record
             allocation["reservation_state"] = "ISSUED"
 
@@ -876,8 +1127,69 @@ class InventoryEngine:
 
             issued_count += 1
 
-        print("Units issued:", request_id, "| Count:", issued_count)
+            # Update hospital's daily issued-unit count
+            self.daily_issued_units[quota_key] = (
+                self.daily_issued_units.get(quota_key, 0) + 1
+            )
 
+        # BR-08: release units beyond the daily quota and queue the shortfall.
+        released_for_quota = 0
+        for allocation in quota_skipped_allocations:
+            unit_id = allocation["unit_id"]
+            info = self.unit_status.get(unit_id, {})
+            if info.get("status") not in ("AVAILABLE", "CROSSMATCHED"):
+                continue
+            info["status"] = "AVAILABLE"
+            info["reason"] = "HOSPITAL_DAILY_QUOTA_LIMIT"
+            allocation["reservation_state"] = "RELEASED"
+            allocation["note"] = "HOSPITAL_DAILY_QUOTA_LIMIT"
+            for reservation in self.reservations:
+                if reservation["request_id"] == request_id and reservation["unit_id"] == unit_id:
+                    reservation["reservation_state"] = "RELEASED"
+            self.output_records["unit_status.csv"].append({
+                "unit_id": unit_id, "ts": current_ts,
+                "status": "AVAILABLE", "reason": "HOSPITAL_DAILY_QUOTA_LIMIT"
+            })
+            if unit_id in self.request_status.get(request_id, {}).get("allocated_units", []):
+                self.request_status[request_id]["allocated_units"].remove(unit_id)
+            released_for_quota += 1
+
+        if released_for_quota:
+            state = self.request_status.get(request_id)
+            if state:
+                state["shortfall"] = state.get("shortfall", 0) + released_for_quota
+                state["status"] = "PARTIAL" if state["allocated_units"] else "PENDING"
+                queue_item = next(
+                    (item for item in self.shortage_queue if item["request_id"] == request_id),
+                    None
+                )
+                if queue_item:
+                    queue_item["shortfall"] = state["shortfall"]
+                else:
+                    self.shortage_queue.append({
+                        "request_id": request_id,
+                        "urgency": urgency,
+                        "request_ts": state.get("request_ts", current_ts),
+                        "shortfall": state["shortfall"]
+                    })
+                shortfall_row = next(
+                    (row for row in self.output_records["allocations.csv"]
+                     if row["request_id"] == request_id and row.get("reservation_state") == "SHORTFALL"),
+                    None
+                )
+                values = {
+                    "request_id": request_id, "unit_id": "", "unit_group": "",
+                    "unit_rh": "", "compatibility_path": "",
+                    "reservation_state": "SHORTFALL", "allocated_ts": current_ts,
+                    "sla_met": False, "note": f"UNFILLED_UNITS:{state['shortfall']}"
+                }
+                if shortfall_row:
+                    shortfall_row.update(values)
+                else:
+                    self.output_records["allocations.csv"].append(values)
+
+        print("Units issued:", request_id, "| Count:", issued_count,
+              "| Quota shortfall:", released_for_quota)
         return issued_count > 0
 
     def process_cancel(self, request_id, current_ts):
@@ -960,127 +1272,103 @@ class InventoryEngine:
 
 
     def process_crossmatch(self, request_id, current_ts, result):
-
+        """Record cross-match results, including emergency retrospective checks."""
         if request_id not in self.requests:
             print("Invalid cross-match request:", request_id)
             return False
-
         result = str(result).strip().upper()
-
-        if result not in ["COMPATIBLE", "INCOMPATIBLE"]:
+        if result not in ("COMPATIBLE", "INCOMPATIBLE"):
             print("Invalid cross-match result:", result)
             return False
 
         matching_reservations = [
-            reservation
-            for reservation in self.reservations
+            reservation for reservation in self.reservations
             if reservation["request_id"] == request_id
         ]
+        emergency_units = [
+            (unit_id, info) for unit_id, info in self.unit_status.items()
+            if info.get("issued_request_id") == request_id
+            and info.get("retrospective_crossmatch") in ("PENDING", "FLAGGED")
+        ]
 
-        if not matching_reservations:
-            print("No reservation found for:", request_id)
+        if not matching_reservations and not emergency_units:
+            print("No pending cross-match found for:", request_id)
             return False
 
         for reservation in matching_reservations:
-
             reservation["crossmatch_result"] = result
             reservation["crossmatch_result_ts"] = current_ts
-
             if result == "INCOMPATIBLE":
                 unit_id = reservation["unit_id"]
+                info = self.unit_status.get(unit_id, {})
+                if info.get("status") == "CROSSMATCHED":
+                    info["status"] = "AVAILABLE"
+                    info["reason"] = "CROSSMATCH_INCOMPATIBLE"
+                    reservation["reservation_state"] = "RELEASED"
 
-                if self.unit_status[unit_id]["status"] == "CROSSMATCHED":
-                    self.unit_status[unit_id]["status"] = "AVAILABLE"
-                    self.unit_status[unit_id]["reason"] = "CROSSMATCH_INCOMPATIBLE"
+        for unit_id, info in emergency_units:
+            issue_ts = info.get("issued_ts", current_ts)
+            state = check_retrospective_crossmatch(issue_ts, current_ts, result)
+            info["retrospective_crossmatch"] = state
+            info["retrospective_crossmatch_result"] = result
+            info["retrospective_crossmatch_ts"] = current_ts
+            if result == "INCOMPATIBLE":
+                info["reason"] = "RETROSPECTIVE_CROSSMATCH_INCOMPATIBLE"
+            elif state == "FLAGGED":
+                info["reason"] = "RETROSPECTIVE_CROSSMATCH_OVERDUE"
 
         print("Cross-match processed:", request_id, "|", result)
         return True
 
-
     def process_return(self, request_id, current_ts, units, cold_chain):
-
+        """Process unused units returned by a hospital."""
         if request_id not in self.requests:
             print("Invalid return request:", request_id)
             return False
-
-        units = int(units)
-
+        try:
+            units = int(units)
+        except (TypeError, ValueError):
+            print("Invalid return quantity:", request_id)
+            return False
         if units <= 0:
             print("Invalid return quantity:", request_id)
             return False
-
-        cold_chain = str(cold_chain).strip().lower() == "true"
-
-        # Find units issued under this request
+        cold_chain = str(cold_chain).strip().lower() in ("true", "1", "yes")
         issued_units = [
-            (unit_id, status_info)
-            for unit_id, status_info in self.unit_status.items()
-            if status_info.get("status") == "ISSUED"
-            and status_info.get("issued_request_id") == request_id
+            (unit_id, info) for unit_id, info in self.unit_status.items()
+            if info.get("status") == "ISSUED" and info.get("issued_request_id") == request_id
         ]
-
         if len(issued_units) < units:
             print("Not enough issued units to return:", request_id)
             return False
-
-        returned_count = 0
-
-        for unit_id, status_info in issued_units[:units]:
-
-            result = evaluate_return(
-                status_info["issued_ts"],
-                current_ts,
-                cold_chain
-            )
-
-            # Remove invoice only if the unit qualifies for a free return
-            if result["billable"] is False:
-
-             self.invoices = [
-             invoice for invoice in self.invoices
-             if not (
-            invoice["request_id"] == request_id
-            and invoice["unit_id"] == unit_id
-        )
-    ]
-
-        self.output_records["invoices.csv"] = [
-        invoice for invoice in self.output_records["invoices.csv"]
-        if not (
-            invoice["request_id"] == request_id
-            and invoice["unit_id"] == unit_id
-        )
-    ]
-
-        status =result["status"]
-
-        status_info["status"] = status
-        status_info["reason"] = (
-                "RETURNED_WITH_COLD_CHAIN"
-                if status == "RETURNED"
+        for unit_id, info in issued_units[:units]:
+            try:
+                result = evaluate_return(info["issued_ts"], current_ts, cold_chain)
+            except (KeyError, TypeError, ValueError) as exc:
+                print("Return rejected:", exc)
+                return False
+            if not result["billable"]:
+                self.invoices = [
+                    row for row in self.invoices
+                    if not (row["request_id"] == request_id and row["unit_id"] == unit_id)
+                ]
+                self.output_records["invoices.csv"] = [
+                    row for row in self.output_records["invoices.csv"]
+                    if not (row["request_id"] == request_id and row["unit_id"] == unit_id)
+                ]
+            status = result["status"]
+            info["status"] = status
+            info["reason"] = (
+                "RETURNED_WITH_COLD_CHAIN" if status == "RETURNED"
                 else "RETURNED_AFTER_LIMIT_OR_COLD_CHAIN_BROKEN"
             )
-
-            # Update unit status history
-        self.output_records["unit_status.csv"].append({
-                "unit_id": unit_id,
-                "ts": current_ts,
-                "status": status,
-                "reason": status_info["reason"]
+            self.output_records["unit_status.csv"].append({
+                "unit_id": unit_id, "ts": current_ts,
+                "status": status, "reason": info["reason"]
             })
-
-        returned_count += 1
-
-        print("Return processed:", unit_id, status)
-
-        print(
-            "Return completed:",
-            request_id,
-            "| Units returned:",
-            returned_count
-        )
-
-        return returned_count == units
+            print("Return processed:", unit_id, status)
+        print("Return completed:", request_id, "| Units returned:", units)
+        return True
 
     def process_print_stock(self, report_date):
         """Generate a blood stock report for the requested date."""
@@ -1198,179 +1486,108 @@ class InventoryEngine:
         return report
 
     def process_daily_run(self, run_date):
-
-        """Perform daily inventory maintenance."""
-
+        """Expire stock and release expired reservations at end of run date."""
         try:
-            report_date = datetime.strptime(run_date, "%Y-%m-%d").date()
-        except ValueError:
+            run_time = datetime.strptime(run_date, "%Y-%m-%d") + timedelta(hours=23, minutes=59, seconds=59)
+        except (TypeError, ValueError):
             print("Invalid daily run date:", run_date)
             return False
-
+        run_ts = run_time.strftime(TIMESTAMP_FORMAT)
         expired_count = 0
-
-        for unit_id, status_info in self.unit_status.items():
-
-            if status_info.get("status") not in ["AVAILABLE", "RETURNED"]:
+        for unit_id, info in self.unit_status.items():
+            if info.get("status") not in ("AVAILABLE", "RETURNED", "CROSSMATCHED"):
                 continue
-
-            expiry_date = status_info.get("expiry_date")
-
-            if not expiry_date:
+            expiry_text = info.get("expiry_date", "")
+            if not expiry_text:
                 continue
-
             try:
-                expiry = datetime.strptime(
-                    expiry_date,
-                    TIMESTAMP_FORMAT
-                ).date()
+                is_expired = datetime.strptime(expiry_text, TIMESTAMP_FORMAT) <= run_time
             except ValueError:
                 continue
-
-            if report_date > expiry:
-
-                status_info["status"] = "EXPIRED"
-                status_info["reason"] = "SHELF_LIFE_EXPIRED"
-
+            if is_expired:
+                info["status"] = "EXPIRED"
+                info["reason"] = "SHELF_LIFE_EXPIRED"
                 self.output_records["unit_status.csv"].append({
-                    "unit_id": unit_id,
-                    "ts": run_date + " 23:59:59",
-                    "status": "EXPIRED",
-                    "reason": "SHELF_LIFE_EXPIRED"
+                    "unit_id": unit_id, "ts": run_ts,
+                    "status": "EXPIRED", "reason": "SHELF_LIFE_EXPIRED"
                 })
-
                 expired_count += 1
 
-        # Release unused cross-match reservations that have expired
-        run_ts = run_date + " 23:59:59"
-
+        released_count = 0
         for reservation in self.reservations:
-
-            if reservation["reservation_state"] != "CROSSMATCHED":
+            if reservation.get("reservation_state") != "CROSSMATCHED":
                 continue
-
-            reservation_status = check_reservation_status(
-                reservation, run_ts
-            )
-
-            if reservation_status == "AVAILABLE":
-
-                unit_id = reservation["unit_id"]
-                request_id = reservation["request_id"]
-
-                reservation["reservation_state"] = "RELEASED"
-
-                self.unit_status[unit_id]["status"] = "AVAILABLE"
-                self.unit_status[unit_id]["reason"] = "RESERVATION_EXPIRED"
-
-                for allocation in self.allocations:
-                    if (
-                        allocation["unit_id"] == unit_id
-                        and allocation["request_id"] == request_id
-                        and allocation["reservation_state"] == "CROSSMATCHED"
-                    ):
-                        allocation["reservation_state"] = "RELEASED"
-
-            # Keep the allocation output record in sync
-            for output_allocation in self.output_records["allocations.csv"]:
-                if (
-                    output_allocation["unit_id"] == unit_id
-                    and output_allocation["request_id"] == request_id
-                ):
-                    output_allocation["reservation_state"] = "RELEASED"
-
+            if check_reservation_status(reservation, run_ts) != "AVAILABLE":
+                continue
+            unit_id = reservation["unit_id"]
+            request_id = reservation["request_id"]
+            reservation["reservation_state"] = "RELEASED"
+            info = self.unit_status.get(unit_id)
+            if info and info.get("status") == "CROSSMATCHED":
+                expiry_text = info.get("expiry_date", "")
+                try:
+                    expired = bool(expiry_text) and datetime.strptime(expiry_text, TIMESTAMP_FORMAT) <= run_time
+                except ValueError:
+                    expired = False
+                info["status"] = "EXPIRED" if expired else "AVAILABLE"
+                info["reason"] = "SHELF_LIFE_EXPIRED" if expired else "RESERVATION_EXPIRED"
                 self.output_records["unit_status.csv"].append({
-                    "unit_id": unit_id,
-                    "ts": run_ts,
-                    "status": "AVAILABLE",
-                    "reason": "RESERVATION_EXPIRED"
+                    "unit_id": unit_id, "ts": run_ts,
+                    "status": info["status"], "reason": info["reason"]
+                })
+            for record in self.allocations + self.output_records["allocations.csv"]:
+                if record["unit_id"] == unit_id and record["request_id"] == request_id:
+                    record["reservation_state"] = "RELEASED"
+            released_count += 1
+
+        # Flag emergency issues with no retrospective cross-match within 24 hours.
+        for unit_id, info in self.unit_status.items():
+            if info.get("retrospective_crossmatch") != "PENDING":
+                continue
+            due_ts = info.get("retrospective_crossmatch_due_ts")
+            if due_ts and due_ts <= run_ts:
+                info["retrospective_crossmatch"] = "FLAGGED"
+                info["reason"] = "RETROSPECTIVE_CROSSMATCH_OVERDUE"
+                self.output_records["unit_status.csv"].append({
+                    "unit_id": unit_id, "ts": run_ts,
+                    "status": info.get("status", "ISSUED"),
+                    "reason": "RETROSPECTIVE_CROSSMATCH_OVERDUE"
                 })
 
-                print("Daily run completed.")
-                print("Expired units:", expired_count)
-
-                return True
+        print("Daily run completed.")
+        print("Expired units:", expired_count)
+        print("Released reservations:", released_count)
+        return True
 
     def process_commands(self, commands):
-
-     print("\nStarting command execution...")
-
-     for command in commands:
-
-        command_type = command["type"]
-        args = command["args"]
-
-        if command_type == "DONATION":
-            self.process_donation(
-                args["donation_id"],
-                args["ts"]
-            )
-
-        elif command_type == "SCREENING":
-            self.process_screening(
-                args["donation_id"],
-                args["ts"]
-            )
-
-        elif command_type == "REQUEST":
-            self.process_request(
-                args["request_id"],
-                args["ts"]
-            )
-
-        elif command_type == "ISSUE":
-            self.process_issue(
-                args["request_id"],
-                args["ts"]
-            )
-
-        elif command_type == "CANCEL_REQUEST":
-            self.process_cancel(
-                args["request_id"],
-                args["ts"]
-            )
-
-        elif command_type == "RETURN":
-            self.process_return(
-                args["request_id"],
-                args["ts"],
-                args["units"],
-                args["cold_chain"]
-            )
-
-        elif command_type == "CROSSMATCH_RESULT":
-            self.process_crossmatch(
-                args["request_id"],
-                args["ts"],
-                args["result"]
-            )
-
-        elif command_type == "DAILY_RUN":
-            self.process_daily_run(
-                args["date"]
-            )
-
-        elif command_type == "PRINT_STOCK":
-            self.process_print_stock(
-                args["date"]
-            )
-
-        elif command_type == "PRINT_INVOICE":
-            self.process_print_invoice(
-                args["hospital_id"],
-                args["from_date"],
-                args["to_date"]
-            )
-
-        else:
-            print(
-                "Command queued for later implementation:",
-                command_type
-            )
-
-        print("\nCommand processing completed.")
-
-
+        """Execute commands in their supplied order."""
+        print("\\nStarting command execution...")
+        for command in commands:
+            command_type = command["type"]
+            args = command["args"]
+            if command_type == "DONATION":
+                self.process_donation(args["donation_id"], args["ts"])
+            elif command_type == "SCREENING":
+                self.process_screening(args["donation_id"], args["ts"])
+            elif command_type == "REQUEST":
+                self.process_request(args["request_id"], args["ts"])
+            elif command_type == "ISSUE":
+                self.process_issue(args["request_id"], args["ts"])
+            elif command_type == "CANCEL_REQUEST":
+                self.process_cancel(args["request_id"], args["ts"])
+            elif command_type == "RETURN":
+                self.process_return(args["request_id"], args["ts"], args["units"], args["cold_chain"])
+            elif command_type == "CROSSMATCH_RESULT":
+                self.process_crossmatch(args["request_id"], args["ts"], args["result"])
+            elif command_type == "DAILY_RUN":
+                self.process_daily_run(args["date"])
+            elif command_type == "PRINT_STOCK":
+                self.process_print_stock(args["date"])
+            elif command_type == "PRINT_INVOICE":
+                self.process_print_invoice(args["hospital_id"], args["from_date"], args["to_date"])
+            else:
+                print("Unsupported command:", command_type)
+        print("\\nCommand processing completed.")
 
     def export_outputs(self):
 
@@ -1387,7 +1604,8 @@ class InventoryEngine:
 
                 writer = csv.DictWriter(
                     file,
-                    fieldnames=OUTPUT_FIELDS[filename]
+                    fieldnames=OUTPUT_FIELDS[filename],
+                    lineterminator="\n"
                 )
 
                 writer.writeheader()
