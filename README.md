@@ -77,3 +77,7 @@ Generated files:
 All output headers follow the required column order in the supplied data-pack
 README. The application does not require a graphical interface; it is a
 CSV-driven Python backend.
+
+## Project Demo Video
+
+[Watch the Project Demo Video](https://drive.google.com/file/d/1MkgmI6ii4Xnsaibbus9SgeSgd_2Ih0Vp/view?usp=sharing)
